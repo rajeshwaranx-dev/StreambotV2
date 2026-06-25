@@ -1,0 +1,20 @@
+[Unit]
+Description=StreambotV2 Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/StreambotV2
+ExecStart=/home/ubuntu/StreambotV2/venv/bin/python bot.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=streambotv2
+
+# Env file — copy .env.example to .env and fill in values
+EnvironmentFile=/home/ubuntu/StreambotV2/.env
+
+[Install]
+WantedBy=multi-user.target
