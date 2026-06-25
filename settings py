@@ -1,0 +1,145 @@
+"""
+settings.py — Admin /settings inline keyboard panel
+"""
+
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import ContextTypes, CallbackQueryHandler
+
+import config
+import db
+from script import about_text
+
+# ── Themes ────────────────────────────────────────────────────
+THEMES = ["dark_gold", "midnight_blue", "deep_purple", "emerald", "crimson"]
+THEME_LABELS = {
+    "dark_gold":     "🌕 Dark Gold",
+    "midnight_blue": "🌊 Midnight Blue",
+    "deep_purple":   "🔮 Deep Purple",
+    "emerald":       "🌿 Emerald",
+    "crimson":       "🔴 Crimson",
+}
+
+# ── Upload modes ──────────────────────────────────────────────
+UPLOAD_MODES = {
+    "buttons": "🔘 Buttons (Watch + Download)",
+    "files":   "📝 Text links",
+}
+
+
+# ── Entry point ───────────────────────────────────────────────
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id not in config.ADMIN_IDS:
+        await update.message.reply_text("⛔ Admins only.")
+        return
+    await update.message.reply_text(
+        "⚙️ <b>Bot Settings</b>",
+        reply_markup=await _main_menu(),
+        parse_mode="HTML",
+    )
+
+
+async def _main_menu() -> InlineKeyboardMarkup:
+    current_theme = await db.get_setting("theme", config.THEME)
+    current_mode = await db.get_setting("upload_mode", config.UPLOAD_MODE)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"🎨 Theme: {THEME_LABELS.get(current_theme, current_theme)}",
+            callback_data="settings:theme_menu",
+        )],
+        [InlineKeyboardButton(
+            f"📤 Upload mode: {UPLOAD_MODES.get(current_mode, current_mode)}",
+            callback_data="settings:mode_menu",
+        )],
+        [InlineKeyboardButton("ℹ️ About", callback_data="settings:about")],
+        [InlineKeyboardButton("❌ Close", callback_data="settings:close")],
+    ])
+
+
+# ── Callback handler ──────────────────────────────────────────
+async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    if update.effective_user.id not in config.ADMIN_IDS:
+        return
+
+    data = query.data  # e.g. "settings:theme_menu" or "settings:set_theme:dark_gold"
+
+    if data == "settings:theme_menu":
+        await query.edit_message_text(
+            "🎨 <b>Choose a theme:</b>",
+            reply_markup=_theme_menu(),
+            parse_mode="HTML",
+        )
+
+    elif data.startswith("settings:set_theme:"):
+        theme = data.split(":")[-1]
+        if theme in THEMES:
+            await db.set_setting("theme", theme)
+        await query.edit_message_text(
+            f"✅ Theme set to <b>{THEME_LABELS.get(theme, theme)}</b>",
+            reply_markup=await _main_menu(),
+            parse_mode="HTML",
+        )
+
+    elif data == "settings:mode_menu":
+        await query.edit_message_text(
+            "📤 <b>Choose upload mode:</b>",
+            reply_markup=_mode_menu(),
+            parse_mode="HTML",
+        )
+
+    elif data.startswith("settings:set_mode:"):
+        mode = data.split(":")[-1]
+        if mode in UPLOAD_MODES:
+            await db.set_setting("upload_mode", mode)
+        await query.edit_message_text(
+            f"✅ Upload mode set to <b>{UPLOAD_MODES.get(mode, mode)}</b>",
+            reply_markup=await _main_menu(),
+            parse_mode="HTML",
+        )
+
+    elif data == "settings:about":
+        await query.edit_message_text(
+            about_text(),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Back", callback_data="settings:back")
+            ]]),
+            parse_mode="HTML",
+        )
+
+    elif data in ("settings:back", "settings:close"):
+        if data == "settings:close":
+            await query.delete_message()
+        else:
+            await query.edit_message_text(
+                "⚙️ <b>Bot Settings</b>",
+                reply_markup=await _main_menu(),
+                parse_mode="HTML",
+            )
+
+
+def _theme_menu() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(label, callback_data=f"settings:set_theme:{key}")]
+        for key, label in THEME_LABELS.items()
+    ]
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="settings:back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _mode_menu() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(label, callback_data=f"settings:set_mode:{key}")]
+        for key, label in UPLOAD_MODES.items()
+    ]
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="settings:back")])
+    return InlineKeyboardMarkup(rows)
+
+
+# ── Exported handler list ─────────────────────────────────────
+def get_handlers():
+    return [
+        CallbackQueryHandler(settings_callback, pattern=r"^settings:"),
+    ]
+
