@@ -1,94 +1,107 @@
 """
-fsub.py — Force subscription check
+fsub.py — Force subscription for StreambotV2
 """
-
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
-from telegram.error import BadRequest, Forbidden
-
-import config
+import db
 from script import fsub_text
 
+logger = logging.getLogger(__name__)
+pending_files: dict[int, dict] = {}
 
-async def check_fsub(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """
-    Returns True if the user is subscribed (or fsub not configured).
-    Sends the join prompt and returns False if they aren't.
-    """
-    if not config.CHANNEL_LINK:
-        return True  # fsub not configured
 
-    user = update.effective_user
-    if user is None:
+async def fsub_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE, pending_data: dict = None) -> bool:
+    cfg = await db.get_fsub()
+    if not cfg or not cfg.get("enabled"):
+        return True
+    msg = update.message or update.channel_post
+    if not msg:
+        return True
+    uid = update.effective_user.id if update.effective_user else None
+    if uid is None:
         return True
 
-    # Admins bypass fsub
-    if user.id in config.ADMIN_IDS:
+    import config
+    if uid in config.ADMIN_IDS:
         return True
 
-    # We need a numeric channel ID for getChatMember
-    # CHANNEL_LINK may be https://t.me/channelname or https://t.me/+inviteHash
-    # For getChatMember, we need @username or numeric ID.
-    # Admins should set LOG_CHANNEL as the numeric ID of the fsub channel,
-    # or we derive @username from CHANNEL_LINK.
-    channel_ref = _channel_ref()
-    if channel_ref is None:
+    chat_id = cfg["chat_id"]
+    mode    = cfg.get("mode", "normal")
+
+    if await _is_subscribed(ctx.bot, uid, chat_id, mode):
         return True
 
-    try:
-        member = await context.bot.get_chat_member(channel_ref, user.id)
-        if member.status in ("member", "administrator", "creator"):
-            return True
-    except (BadRequest, Forbidden):
-        pass  # can't check → let through silently
-    except Exception:
-        pass
+    if pending_data:
+        pending_files[uid] = pending_data
 
-    # Not subscribed — send prompt
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            f"📢 Join {config.CHANNEL_NAME or 'Channel'}",
-            url=config.CHANNEL_LINK,
-        )],
-        [InlineKeyboardButton("✅ Try Again", callback_data="fsub_check")],
+    chat_link  = cfg.get("chat_link", "")
+    chat_name  = cfg.get("chat_title", "our channel")
+    join_label = "📨 Request to Join" if mode == "request" else "📢 Join Channel"
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(join_label, url=chat_link)],
+        [InlineKeyboardButton("✅ I Joined", callback_data=f"fsub:check:{chat_id}")],
     ])
-    msg = update.effective_message
-    if msg:
-        await msg.reply_text(
-            fsub_text(
-                config.CHANNEL_NAME or "our channel",
-                config.CHANNEL_LINK,
-            ),
-            reply_markup=keyboard,
-            parse_mode="HTML",
-        )
+    await msg.reply_text(
+        fsub_text(chat_name, join_label),
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
     return False
 
 
-def _channel_ref() -> str | None:
-    """Extract @username from CHANNEL_LINK, or return None."""
-    link = config.CHANNEL_LINK.strip().rstrip("/")
-    if not link:
-        return None
-    # https://t.me/username → @username
-    if "t.me/" in link and not link.endswith("+"):
-        slug = link.split("t.me/")[-1].split("?")[0]
-        if not slug.startswith("+"):
-            return "@" + slug
-    # If a numeric LOG_CHANNEL is set, use that instead
-    if config.LOG_CHANNEL:
-        return str(config.LOG_CHANNEL)
-    return None
+async def _is_subscribed(bot, uid: int, chat_id: int, mode: str) -> bool:
+    try:
+        member = await bot.get_chat_member(chat_id, uid)
+        status = member.status
+        if status in ("member", "administrator", "creator"):
+            return True
+        if status == "restricted":
+            return True
+        if status == "kicked":
+            return False
+        if mode == "request":
+            return await db.has_join_request(uid, chat_id)
+        return False
+    except Exception as e:
+        logger.warning(f"[FSUB] check error uid={uid}: {e}")
+        return True  # fail open
 
 
-async def fsub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles the 'Try Again' button press."""
-    query = update.callback_query
-    await query.answer()
+async def handle_fsub_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q       = update.callback_query
+    uid     = q.from_user.id
+    chat_id = int(q.data.split(":")[2])
+    await q.answer()
 
-    passed = await check_fsub(update, context)
-    if passed:
-        await query.edit_message_text("✅ You're subscribed! Send me a file to get started.")
-    else:
-        await query.answer("❌ Not subscribed yet — please join first.", show_alert=True)
-  
+    cfg  = await db.get_fsub() or {}
+    mode = cfg.get("mode", "normal")
+
+    if await _is_subscribed(ctx.bot, uid, chat_id, mode):
+        pdata = pending_files.pop(uid, None)
+        try:
+            await q.edit_message_text("✅ <b>Access granted!</b> Send me a file to get started.", parse_mode="HTML")
+        except Exception:
+            pass
+        return
+
+    chat_link  = cfg.get("chat_link", "")
+    chat_name  = cfg.get("chat_title", "our channel")
+    join_label = "📨 Request to Join" if mode == "request" else "📢 Join Channel"
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(join_label, url=chat_link)],
+        [InlineKeyboardButton("✅ I Joined", callback_data=f"fsub:check:{chat_id}")],
+    ])
+    try:
+        await q.edit_message_text(
+            f"❌ <b>Not verified!</b>\n\nPlease join <b>{chat_name}</b> first.",
+            parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        pass
+
+
+async def handle_join_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    req = update.chat_join_request
+    if req:
+        await db.set_join_request(req.from_user.id, req.chat.id)
