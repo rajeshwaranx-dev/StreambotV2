@@ -106,6 +106,20 @@ async function handleStream(request, env, url) {
     return new Response("Forbidden", { status:403 });
   const meta = decodeToken(token);
   if (!meta?.fileId) return new Response("Bad token", { status:400 });
+
+  const seq = url.pathname.slice(8);
+
+  // Route through VPS stream server if configured (4GB+ support)
+  if (env.STREAM_SERVER_URL) {
+    const vpsUrl = `${env.STREAM_SERVER_URL}/stream/${seq}?hash=${hash}&token=${token}`;
+    const range  = request.headers.get("Range");
+    const up     = await fetch(vpsUrl, { headers: range ? { Range:range } : {} });
+    const h      = new Headers(up.headers);
+    h.set("Access-Control-Allow-Origin","*");
+    return new Response(up.body, { status:up.status, headers:h });
+  }
+
+  // Fallback: Telegram bot API (20MB limit)
   const info = await getTgFile(meta.fileId, env.BOT_TOKEN);
   if (!info) return new Response("File not found on Telegram", { status:404 });
   const tgUrl = `https://api.telegram.org/file/bot${env.BOT_TOKEN}/${info.file_path}`;
@@ -130,6 +144,19 @@ async function handleFile(request, env, url) {
     return new Response("Forbidden", { status:403 });
   const meta = decodeToken(token);
   if (!meta?.fileId) return new Response("Bad token", { status:400 });
+
+  const seq = url.pathname.slice(6);
+
+  // Route through VPS stream server if configured (4GB+ support)
+  if (env.STREAM_SERVER_URL) {
+    const vpsUrl = `${env.STREAM_SERVER_URL}/file/${seq}?hash=${hash}&token=${token}`;
+    const up     = await fetch(vpsUrl);
+    const h      = new Headers(up.headers);
+    h.set("Access-Control-Allow-Origin","*");
+    return new Response(up.body, { status:up.status, headers:h });
+  }
+
+  // Fallback: Telegram bot API (20MB limit)
   const info = await getTgFile(meta.fileId, env.BOT_TOKEN);
   if (!info) return new Response("File not found on Telegram", { status:404 });
   const tgUrl = `https://api.telegram.org/file/bot${env.BOT_TOKEN}/${info.file_path}`;
@@ -566,4 +593,4 @@ function mimeIcon(m) {
 function mimeLabel(m) {
   if (!m) return "File";
   return m.split("/")[1]?.toUpperCase() || m;
-        }
+}
