@@ -1,551 +1,443 @@
 """
 bot.py — StreambotV2 main bot
-PTB 20.x  |  Cloudflare Worker streaming
 """
-
-import asyncio
-import base64
-import hashlib
-import hmac
-import json
-import logging
-import os
-import re
-from typing import Optional
-
-from telegram import (
-    Update,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    Message,
-)
+import asyncio, base64, hashlib, hmac, json, logging
+from datetime import datetime
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ParseMode
 from telegram.error import Forbidden, BadRequest
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
+    Application, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ChatJoinRequestHandler, ContextTypes, filters,
 )
-
-import config
-import db
-from fsub import check_fsub, fsub_callback
+import config, db
+from fsub import fsub_check, handle_fsub_callback, handle_join_request
 from script import (
-    start_text, HELP_TEXT, stats_text,
-    file_link_text, new_user_log, new_channel_log,
-    banned_text, unbanned_text, not_banned_text,
-    broadcast_done,
+    START_TEXT, HELP_TEXT, ABOUT_TEXT,
+    stats_text, new_user_log, new_channel_log, file_log,
+    banned_text, unbanned_text, not_banned_text, broadcast_done,
 )
-from settings import settings_command, get_handlers as settings_handlers
+from settings import (
+    settings_cmd, settings_callback, get_handlers as settings_handlers,
+    handle_settings_text, handle_add_channel,
+    pending_text_filter, pending_add_filter, shorten_url,
+)
 
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(format="%(asctime)s | %(levelname)s | %(name)s | %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
 
-# ════════════════════════════════════════════════════════════════
-#  Token helpers
-# ════════════════════════════════════════════════════════════════
-
+# ── Token helpers ─────────────────────────────────────────────
 def _b64(data: dict) -> str:
-    """Base64url-encode a JSON dict (no padding)."""
     return base64.urlsafe_b64encode(
         json.dumps(data, separators=(",", ":")).encode()
     ).decode().rstrip("=")
 
-
-def _make_token(seq: str, file_id: str, file_name: str,
-                mime_type: str, file_size: int) -> str:
-    """Build token: 000001_<b64url(meta)>"""
-    meta = {
-        "fileId": file_id,
-        "fileName": file_name,
-        "mimeType": mime_type,
-        "fileSize": file_size,
-    }
+def _make_token(seq, file_id, file_name, mime_type, file_size):
+    safe_name = file_name.encode("ascii", "ignore").decode()[:60] or "file"
+    meta = {"fileId": file_id, "fileName": safe_name, "mimeType": mime_type, "fileSize": file_size}
     return f"{seq}_{_b64(meta)}"
 
+def _make_hash(token):
+    return hmac.new(config.SECRET_KEY.encode(), token.encode(), hashlib.sha256).hexdigest()
 
-def _make_hash(token: str) -> str:
-    """HMAC-SHA256 of token using SECRET_KEY (hex digest, 16 chars = 64 bits)."""
-    sig = hmac.new(
-        config.SECRET_KEY.encode(),
-        token.encode(),
-        hashlib.sha256,
-    ).hexdigest()
-    return sig[:16]  # 64-bit prefix — short but sufficient for URLs
-
-
-def _make_urls(token: str) -> tuple[str, str]:
-    h = _make_hash(token)
+def _make_urls(token):
+    h   = _make_hash(token)
     seq = token.split("_")[0]
-    watch = f"{config.WORKER_URL}/watch/{seq}?hash={h}&theme={config.THEME}"
-    download = f"{config.WORKER_URL}/file/{token}?hash={h}"
+    watch    = f"{config.WORKER_URL}/watch/{seq}?hash={h}&theme={config.THEME}&token={token}"
+    download = f"{config.WORKER_URL}/file/{seq}?hash={h}&token={token}"
     return watch, download
 
-
-def _fmt_bytes(n: int) -> str:
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024:
-            return f"{n:.1f} {unit}"
+def _fmt(n):
+    for u in ("B","KB","MB","GB"):
+        if n < 1024: return f"{n:.1f} {u}"
         n /= 1024
     return f"{n:.1f} TB"
 
+def _infer_name(msg):
+    if msg.video: return f"video_{msg.message_id}.mp4"
+    if msg.audio: return f"audio_{msg.message_id}.mp3"
+    if msg.photo: return f"photo_{msg.message_id}.jpg"
+    return f"file_{msg.message_id}"
 
-# ════════════════════════════════════════════════════════════════
-#  URL shortener (optional, pluggable)
-# ════════════════════════════════════════════════════════════════
+def _infer_mime(msg):
+    if msg.video: return "video/mp4"
+    if msg.audio: return "audio/mpeg"
+    if msg.photo: return "image/jpeg"
+    return "application/octet-stream"
 
-async def shorten_url(url: str) -> str:
-    """Override this to use your preferred shortener API."""
-    return url  # passthrough — replace with actual shortener
-
-
-# ════════════════════════════════════════════════════════════════
-#  Admin guard
-# ════════════════════════════════════════════════════════════════
-
-def admin_only(func):
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def admin_only(f):
+    async def w(update, ctx):
         if update.effective_user.id not in config.ADMIN_IDS:
             await update.effective_message.reply_text("⛔ Admins only.")
             return
-        return await func(update, context)
-    wrapper.__name__ = func.__name__
-    return wrapper
+        return await f(update, ctx)
+    w.__name__ = f.__name__
+    return w
 
 
-# ════════════════════════════════════════════════════════════════
-#  Handlers
-# ════════════════════════════════════════════════════════════════
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
+# ── Start / Help / About ──────────────────────────────────────
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user   = update.effective_user
     is_new = await db.upsert_user(user.id, user.username, user.full_name)
 
-    # Log new user
     if is_new and config.LOG_CHANNEL:
         total = await db.count_users()
         try:
-            await context.bot.send_message(
+            await ctx.bot.send_message(
                 config.LOG_CHANNEL,
                 new_user_log(user.id, user.full_name, user.username, total),
                 parse_mode=ParseMode.HTML,
             )
-        except Exception:
-            pass
+        except Exception: pass
+
+    text = START_TEXT.format(name=user.first_name)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"📢 Join {config.CHANNEL_NAME}", url=config.CHANNEL_LINK)]
+        if config.CHANNEL_LINK else [],
+        [InlineKeyboardButton("ℹ️ About",    callback_data="start:about"),
+         InlineKeyboardButton("❓ Help",     callback_data="start:help")],
+        [InlineKeyboardButton("⚙️ Settings", callback_data="start:settings")],
+    ])
+    # remove empty rows
+    kb.inline_keyboard = [r for r in kb.inline_keyboard if r]
 
     msg = update.effective_message
     if config.START_IMAGE:
         try:
-            await msg.reply_photo(
-                config.START_IMAGE,
-                caption=start_text(user.first_name),
-                parse_mode=ParseMode.HTML,
-            )
+            await msg.reply_photo(config.START_IMAGE, caption=text, parse_mode=ParseMode.HTML, reply_markup=kb)
             return
+        except Exception: pass
+    await msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🏠 Home",  callback_data="start:home"),
+         InlineKeyboardButton("ℹ️ About", callback_data="start:about")],
+        [InlineKeyboardButton("❌ Close", callback_data="start:close")],
+    ])
+    await update.effective_message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+async def start_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    async def _edit(text, kb):
+        try: await q.edit_message_caption(caption=text, parse_mode=ParseMode.HTML, reply_markup=kb)
         except Exception:
-            pass
-    await msg.reply_text(
-        start_text(user.first_name),
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
-    )
+            try: await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+            except Exception: pass
+
+    home_kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"📢 Join {config.CHANNEL_NAME}", url=config.CHANNEL_LINK)]
+        if config.CHANNEL_LINK else [],
+        [InlineKeyboardButton("ℹ️ About",    callback_data="start:about"),
+         InlineKeyboardButton("❓ Help",     callback_data="start:help")],
+        [InlineKeyboardButton("⚙️ Settings", callback_data="start:settings")],
+    ])
+    home_kb.inline_keyboard = [r for r in home_kb.inline_keyboard if r]
+
+    if q.data == "start:home":
+        text = START_TEXT.format(name=q.from_user.first_name)
+        await _edit(text, home_kb)
+
+    elif q.data == "start:help":
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🏠 Home",  callback_data="start:home"),
+             InlineKeyboardButton("ℹ️ About", callback_data="start:about")],
+            [InlineKeyboardButton("❌ Close", callback_data="start:close")],
+        ])
+        await _edit(HELP_TEXT, kb)
+
+    elif q.data == "start:about":
+        rows = []
+        if config.SOURCE_CODE:
+            rows.append([InlineKeyboardButton("📂 Source Code", url=config.SOURCE_CODE)])
+        rows.append([
+            InlineKeyboardButton("🏠 Home",  callback_data="start:home"),
+            InlineKeyboardButton("❌ Close", callback_data="start:close"),
+        ])
+        text = ABOUT_TEXT.format(
+            bot_name=config.BOT_NAME, developer=config.DEVELOPER,
+            channel_name=config.CHANNEL_NAME, version=config.BOT_VERSION,
+            hosting=config.BOT_HOSTING,
+        )
+        await _edit(text, InlineKeyboardMarkup(rows))
+
+    elif q.data == "start:settings":
+        from settings import _main_kb
+        await _edit("⚙️ <b>SETTINGS</b>\n\nChoose what to configure:", _main_kb())
+
+    elif q.data == "start:close":
+        try: await q.delete_message()
+        except Exception: pass
 
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(
-        HELP_TEXT, parse_mode=ParseMode.HTML
-    )
-
-
+# ── Stats ─────────────────────────────────────────────────────
 @admin_only
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    users = await db.count_users()
-    files = await db.count_files()
-    channels = await db.count_channels()
-    banned = await db.count_banned()
+async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u = await db.count_users()
+    f = await db.count_files()
+    c = await db.count_channels()
+    b = await db.count_banned()
     await update.effective_message.reply_text(
-        stats_text(users, files, channels, banned),
+        stats_text(u, f, c, b, config.BOT_NAME, config.BOT_VERSION, config.BOT_HOSTING),
         parse_mode=ParseMode.HTML,
     )
 
 
 # ── Ban / Unban ───────────────────────────────────────────────
-
 @admin_only
-async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
-    if context.args:
-        try:
-            uid = int(context.args[0])
-        except ValueError:
-            await msg.reply_text("Usage: /ban <user_id>")
-            return
+    uid = None
+    if ctx.args:
+        try: uid = int(ctx.args[0])
+        except ValueError: pass
     elif msg.reply_to_message:
         uid = msg.reply_to_message.from_user.id
-    else:
-        await msg.reply_text("Usage: /ban <user_id>  or reply to a message")
-        return
-    reason = " ".join(context.args[1:]) if context.args and len(context.args) > 1 else ""
+    if not uid:
+        await msg.reply_text("Usage: /ban <user_id>"); return
+    reason = " ".join(ctx.args[1:]) if ctx.args and len(ctx.args) > 1 else ""
     await db.ban_user(uid, reason)
     await msg.reply_text(banned_text(uid), parse_mode=ParseMode.HTML)
 
-
 @admin_only
-async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
-    if context.args:
-        try:
-            uid = int(context.args[0])
-        except ValueError:
-            await msg.reply_text("Usage: /unban <user_id>")
-            return
+    uid = None
+    if ctx.args:
+        try: uid = int(ctx.args[0])
+        except ValueError: pass
     elif msg.reply_to_message:
         uid = msg.reply_to_message.from_user.id
-    else:
-        await msg.reply_text("Usage: /unban <user_id>  or reply to a message")
-        return
-
-    is_b = await db.is_banned(uid)
-    if is_b:
+    if not uid:
+        await msg.reply_text("Usage: /unban <user_id>"); return
+    if await db.is_banned(uid):
         await db.unban_user(uid)
         await msg.reply_text(unbanned_text(uid), parse_mode=ParseMode.HTML)
     else:
         await msg.reply_text(not_banned_text(uid), parse_mode=ParseMode.HTML)
 
 
-# ── Channel management ────────────────────────────────────────
-
+# ── Fsub commands ─────────────────────────────────────────────
 @admin_only
-async def cmd_addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.effective_message
-    if not context.args:
-        await msg.reply_text(
-            "Usage: /addchannel <channel_id>\n\n"
-            "Forward a message from the channel to this bot first,\n"
-            "then run: /addchannel -100xxxxxxxxxx"
-        )
+async def cmd_setfsub(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        await update.effective_message.reply_text(
+            "Usage: /setfsub <chat_id> <link> [mode]\nmode: normal or request")
         return
+    chat_id = int(ctx.args[0])
+    link    = ctx.args[1] if len(ctx.args) > 1 else ""
+    mode    = ctx.args[2] if len(ctx.args) > 2 else "normal"
     try:
-        cid = int(context.args[0])
-    except ValueError:
-        await msg.reply_text("Invalid channel ID.")
-        return
-    try:
-        chat = await context.bot.get_chat(cid)
-        title = chat.title or str(cid)
+        chat = await ctx.bot.get_chat(chat_id)
+        title = chat.title or str(chat_id)
     except Exception:
-        title = str(cid)
-    await db.add_channel(cid, title, update.effective_user.id)
-
-    if config.LOG_CHANNEL:
-        try:
-            await context.bot.send_message(
-                config.LOG_CHANNEL,
-                new_channel_log(cid, title, update.effective_user.id),
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception:
-            pass
-
-    await msg.reply_text(f"✅ Channel <b>{title}</b> connected.", parse_mode=ParseMode.HTML)
-
+        title = str(chat_id)
+    await db.set_fsub(chat_id, title, link, mode)
+    await update.effective_message.reply_text(f"✅ Force-sub set to <b>{title}</b>", parse_mode=ParseMode.HTML)
 
 @admin_only
-async def cmd_delchannel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.effective_message
-    if not context.args:
-        await msg.reply_text("Usage: /delchannel <channel_id>")
-        return
-    try:
-        cid = int(context.args[0])
-    except ValueError:
-        await msg.reply_text("Invalid channel ID.")
-        return
-    await db.remove_channel(cid)
-    await msg.reply_text(f"✅ Channel <code>{cid}</code> removed.", parse_mode=ParseMode.HTML)
+async def cmd_removefsub(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await db.disable_fsub()
+    await update.effective_message.reply_text("✅ Force-sub disabled.")
+
+@admin_only
+async def cmd_fsubstatus(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    cfg = await db.get_fsub()
+    if not cfg or not cfg.get("enabled"):
+        await update.effective_message.reply_text("ℹ️ Force-sub is disabled.")
+    else:
+        await update.effective_message.reply_text(
+            f"✅ Force-sub enabled\n"
+            f"Channel: <b>{cfg.get('chat_title')}</b>\n"
+            f"Mode: <code>{cfg.get('mode','normal')}</code>",
+            parse_mode=ParseMode.HTML)
 
 
 # ── Broadcast ─────────────────────────────────────────────────
-
 @admin_only
-async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if not msg.reply_to_message:
-        await msg.reply_text("Reply to a message to broadcast it.")
-        return
-    source = msg.reply_to_message
+        await msg.reply_text("Reply to a message to broadcast it."); return
+    source   = msg.reply_to_message
     user_ids = await db.all_user_ids()
     sent = failed = 0
-    status_msg = await msg.reply_text(f"📣 Broadcasting to {len(user_ids):,} users…")
-
+    status = await msg.reply_text(f"📣 Broadcasting to {len(user_ids):,} users…")
     for uid in user_ids:
         try:
-            await source.copy(uid)
-            sent += 1
-        except (Forbidden, BadRequest):
-            failed += 1
-        except Exception:
-            failed += 1
+            await source.copy(uid); sent += 1
+        except (Forbidden, BadRequest): failed += 1
+        except Exception: failed += 1
         if (sent + failed) % 50 == 0:
-            try:
-                await status_msg.edit_text(
-                    f"📣 Progress: {sent + failed}/{len(user_ids)}"
-                )
-            except Exception:
-                pass
-        await asyncio.sleep(0.05)  # ~20 msg/s — stay under Telegram limits
-
-    await status_msg.edit_text(
-        broadcast_done(sent, failed), parse_mode=ParseMode.HTML
-    )
+            try: await status.edit_text(f"📣 Progress: {sent+failed}/{len(user_ids)}")
+            except Exception: pass
+        await asyncio.sleep(0.05)
+    await status.edit_text(broadcast_done(sent, failed), parse_mode=ParseMode.HTML)
 
 
 # ── File handler ──────────────────────────────────────────────
-
-async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    msg = update.effective_message
+    msg  = update.effective_message
 
-    # Ban check
     if await db.is_banned(user.id):
-        await msg.reply_text("🚫 You are banned from using this bot.")
+        await msg.reply_text("🚫 You are banned from this bot."); return
+
+    if not await fsub_check(update, ctx):
         return
 
-    # Force-sub check
-    if not await check_fsub(update, context):
-        return
-
-    # Upsert user silently (might already exist)
     await db.upsert_user(user.id, user.username, user.full_name)
 
-    # Extract file object
-    file_obj = (
-        msg.video or msg.audio or msg.document or
-        (msg.photo[-1] if msg.photo else None)
-    )
-    if file_obj is None:
-        return
+    file_obj = msg.video or msg.audio or msg.document or (msg.photo[-1] if msg.photo else None)
+    if not file_obj: return
 
-    file_id = file_obj.file_id
-    file_unique_id = file_obj.file_unique_id
-    file_size = getattr(file_obj, "file_size", 0) or 0
+    file_id       = file_obj.file_id
+    file_unique_id= file_obj.file_unique_id
+    file_size     = getattr(file_obj, "file_size", 0) or 0
+    file_name     = getattr(file_obj, "file_name", None) or getattr(file_obj, "title", None) or _infer_name(msg)
+    mime_type     = getattr(file_obj, "mime_type", None) or _infer_mime(msg)
+    caption       = msg.caption or ""
+    is_channel    = update.channel_post is not None
 
-    # File name
-    file_name = (
-        getattr(file_obj, "file_name", None)
-        or getattr(file_obj, "title", None)
-        or _infer_name(msg)
-    )
+    proc = await msg.reply_text("⏳ Processing…")
 
-    # MIME type
-    mime_type = (
-        getattr(file_obj, "mime_type", None)
-        or _infer_mime(msg)
-    )
-
-    # Caption (from the message or admin-set template)
-    caption = msg.caption or ""
-
-    # Sequential token
-    seq = await db.next_seq()
+    seq   = await db.next_seq()
     token = _make_token(seq, file_id, file_name, mime_type, file_size)
-    watch_url, download_url = _make_urls(token)
-    short_url = await shorten_url(watch_url)
+    watch_url, dl_url = _make_urls(token)
 
-    # Persist
-    await db.save_file(
-        seq=seq,
-        file_id=file_id,
-        file_unique_id=file_unique_id,
-        file_name=file_name,
-        mime_type=mime_type,
-        file_size=file_size,
-        caption=caption,
-        uploader_id=user.id,
-        channel_id=None,
-        token=token,
-        short_url=short_url,
-    )
+    # Per-user shortener
+    short_url = watch_url
+    if not is_channel:
+        u = await db.get_user(user.id)
+        if u.get("shortener_url") and u.get("shortener_enabled", True):
+            short_url = await shorten_url(u["shortener_url"], u.get("shortener_api_key",""), watch_url)
 
-    # Read upload mode from DB (admin can change via /settings)
-    upload_mode = await db.get_setting("upload_mode", config.UPLOAD_MODE)
-    size_str = _fmt_bytes(file_size)
-
-    if upload_mode == "buttons":
-        is_video = mime_type.startswith("video") if mime_type else False
-        is_audio = mime_type.startswith("audio") if mime_type else False
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "▶️ Watch" if is_video else ("🎵 Play" if is_audio else "👁 View"),
-                    url=short_url,
-                ),
-                InlineKeyboardButton("⬇️ Download", url=download_url),
-            ]
-        ])
-        reply_text = (
-            f"✅ <b>{file_name}</b>\n"
-            f"📦 {size_str}"
-            + (f"\n\n📝 {caption}" if caption else "")
-        )
-        await msg.reply_text(
-            reply_text,
-            reply_markup=keyboard,
-            parse_mode=ParseMode.HTML,
-        )
-    else:
-        await msg.reply_text(
-            file_link_text(file_name, short_url, download_url, size_str, caption),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-
-
-# ── Channel post automation ───────────────────────────────────
-
-async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Auto-process files posted to connected channels."""
-    msg = update.channel_post
-    if msg is None:
-        return
-
-    channels = await db.get_all_channels()
-    connected_ids = {ch["_id"] for ch in channels}
-    if msg.chat.id not in connected_ids:
-        return
-
-    file_obj = (
-        msg.video or msg.audio or msg.document or
-        (msg.photo[-1] if msg.photo else None)
-    )
-    if file_obj is None:
-        return
-
-    file_id = file_obj.file_id
-    file_unique_id = file_obj.file_unique_id
-    file_size = getattr(file_obj, "file_size", 0) or 0
-    file_name = getattr(file_obj, "file_name", None) or _infer_name(msg)
-    mime_type = getattr(file_obj, "mime_type", None) or _infer_mime(msg)
-    caption = msg.caption or ""
-
-    seq = await db.next_seq()
-    token = _make_token(seq, file_id, file_name, mime_type, file_size)
-    watch_url, download_url = _make_urls(token)
-    short_url = await shorten_url(watch_url)
+    # Channel shortener
+    if is_channel:
+        ch = await db.get_channel(msg.chat.id)
+        if ch and ch.get("shortener_url") and ch.get("shortener_enabled", True):
+            short_url = await shorten_url(ch["shortener_url"], ch.get("shortener_api_key",""), watch_url)
 
     await db.save_file(
         seq=seq, file_id=file_id, file_unique_id=file_unique_id,
         file_name=file_name, mime_type=mime_type, file_size=file_size,
-        caption=caption, uploader_id=0, channel_id=msg.chat.id,
+        caption=caption, uploader_id=user.id if user else 0,
+        channel_id=msg.chat.id if is_channel else None,
         token=token, short_url=short_url,
     )
 
-    upload_mode = await db.get_setting("upload_mode", config.UPLOAD_MODE)
-    size_str = _fmt_bytes(file_size)
+    size_str   = _fmt(file_size)
+    is_video   = mime_type.startswith("video") if mime_type else False
+    is_audio   = mime_type.startswith("audio") if mime_type else False
 
-    if upload_mode == "buttons":
-        is_video = mime_type.startswith("video") if mime_type else False
-        is_audio = mime_type.startswith("audio") if mime_type else False
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "▶️ Watch" if is_video else ("🎵 Play" if is_audio else "👁 View"),
-                    url=short_url,
-                ),
-                InlineKeyboardButton("⬇️ Download", url=download_url),
-            ]
-        ])
-        try:
-            await msg.reply_text(
-                f"🔗 <b>{file_name}</b> — {size_str}",
-                reply_markup=keyboard,
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception:
-            pass
+    # Determine upload mode
+    if is_channel:
+        ch = await db.get_channel(msg.chat.id)
+        mode     = (ch or {}).get("upload_mode", "buttons")
+        btns_on  = (ch or {}).get("buttons_enabled", True)
+        tmpl     = (ch or {}).get("caption_template")
     else:
+        u        = await db.get_user(user.id)
+        mode     = u.get("upload_mode", "buttons")
+        btns_on  = u.get("buttons_enabled", True)
+        tmpl     = u.get("caption_template")
+
+    if tmpl:
+        reply_text = (tmpl
+            .replace("{caption}", file_name).replace("{file_name}", file_name)
+            .replace("{stream_link}", short_url).replace("{download_link}", dl_url)
+            .replace("{size}", size_str).replace("{token}", token))
+    else:
+        icon = "🎬" if is_video else "🎵" if is_audio else "📄"
+        reply_text = (
+            f"{icon} <b>{file_name}</b>\n\n"
+            f"📦 Size: <code>{size_str}</code>\n"
+            f"🔑 Token: <code>{token}</code>"
+        )
+
+    kb = None
+    if btns_on:
+        watch_label = "▶️ Watch Online" if is_video else ("🎵 Play" if is_audio else "👁 View")
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(watch_label, url=short_url),
+             InlineKeyboardButton("📥 Download", url=dl_url)],
+        ])
+
+    await proc.delete()
+    try:
+        await msg.reply_text(reply_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    except Exception:
+        await msg.reply_text(reply_text, reply_markup=kb)
+
+    # Log to log channel
+    if config.LOG_CHANNEL:
         try:
-            await msg.reply_text(
-                file_link_text(file_name, short_url, download_url, size_str, caption),
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
+            now = datetime.utcnow().strftime("%d %b %Y, %I:%M %p UTC")
+            log_text = file_log(
+                user.id if user else 0,
+                user.username if user else None,
+                user.full_name if user else "Channel",
+                file_name, size_str, short_url, now,
             )
-        except Exception:
-            pass
+            log_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("▶️ Watch Online", url=short_url),
+                 InlineKeyboardButton("📥 Download", url=dl_url)],
+            ])
+            await ctx.bot.send_message(config.LOG_CHANNEL, log_text,
+                                       parse_mode=ParseMode.HTML, reply_markup=log_kb)
+        except Exception as e:
+            log.warning(f"Log channel error: {e}")
 
 
-# ════════════════════════════════════════════════════════════════
-#  Helpers
-# ════════════════════════════════════════════════════════════════
-
-def _infer_name(msg: Message) -> str:
-    if msg.video:
-        return f"video_{msg.message_id}.mp4"
-    if msg.audio:
-        return f"audio_{msg.message_id}.mp3"
-    if msg.photo:
-        return f"photo_{msg.message_id}.jpg"
-    if msg.document:
-        return f"document_{msg.message_id}"
-    return f"file_{msg.message_id}"
+# ── Delete callback ───────────────────────────────────────────
+async def handle_del_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if q.data.startswith("del:"):
+        seq = q.data[4:]
+        doc = await db.get_file(seq)
+        if doc and doc.get("uploader_id") == q.from_user.id:
+            await db.delete_file(seq)
+            await q.edit_message_text("✅ File deleted.")
+        else:
+            await q.answer("❌ Cannot delete.", show_alert=True)
 
 
-def _infer_mime(msg: Message) -> str:
-    if msg.video:
-        return "video/mp4"
-    if msg.audio:
-        return "audio/mpeg"
-    if msg.photo:
-        return "image/jpeg"
-    return "application/octet-stream"
-
-
-# ════════════════════════════════════════════════════════════════
-#  Application setup
-# ════════════════════════════════════════════════════════════════
-
-def build_app() -> Application:
+# ── App builder ───────────────────────────────────────────────
+def build_app():
     app = Application.builder().token(config.BOT_TOKEN).build()
 
-    # Commands
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("stats", cmd_stats))
-    app.add_handler(CommandHandler("settings", settings_command))
-    app.add_handler(CommandHandler("ban", cmd_ban))
-    app.add_handler(CommandHandler("unban", cmd_unban))
-    app.add_handler(CommandHandler("addchannel", cmd_addchannel))
-    app.add_handler(CommandHandler("delchannel", cmd_delchannel))
-    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
+    app.add_handler(CommandHandler("start",       cmd_start))
+    app.add_handler(CommandHandler("help",        cmd_help))
+    app.add_handler(CommandHandler("stats",       cmd_stats))
+    app.add_handler(CommandHandler("settings",    settings_cmd))
+    app.add_handler(CommandHandler("ban",         cmd_ban))
+    app.add_handler(CommandHandler("unban",       cmd_unban))
+    app.add_handler(CommandHandler("broadcast",   cmd_broadcast))
+    app.add_handler(CommandHandler("setfsub",     cmd_setfsub))
+    app.add_handler(CommandHandler("removefsub",  cmd_removefsub))
+    app.add_handler(CommandHandler("fsubstatus",  cmd_fsubstatus))
 
-    # Inline callbacks
-    app.add_handler(CallbackQueryHandler(fsub_callback, pattern=r"^fsub_check$"))
+    app.add_handler(CallbackQueryHandler(start_callback,      pattern=r"^start:"))
+    app.add_handler(CallbackQueryHandler(handle_fsub_callback,pattern=r"^fsub:"))
+    app.add_handler(CallbackQueryHandler(handle_del_callback, pattern=r"^del:"))
     for h in settings_handlers():
         app.add_handler(h)
 
-    # File messages (private chats)
-    app.add_handler(MessageHandler(
-        filters.ChatType.PRIVATE & (
-            filters.VIDEO | filters.AUDIO |
-            filters.Document.ALL | filters.PHOTO
-        ),
-        handle_file,
-    ))
+    app.add_handler(ChatJoinRequestHandler(handle_join_request))
 
-    # Channel posts
+    app.add_handler(MessageHandler(filters.FORWARDED & pending_add_filter, handle_add_channel))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & pending_text_filter, handle_settings_text))
+
     app.add_handler(MessageHandler(
-        filters.UpdateType.CHANNEL_POST & (
-            filters.VIDEO | filters.AUDIO |
-            filters.Document.ALL | filters.PHOTO
-        ),
-        handle_channel_post,
+        (filters.ChatType.PRIVATE | filters.UpdateType.CHANNEL_POST) &
+        (filters.VIDEO | filters.AUDIO | filters.Document.ALL | filters.PHOTO),
+        handle_file,
     ))
 
     return app
@@ -554,4 +446,3 @@ def build_app() -> Application:
 if __name__ == "__main__":
     log.info("Starting StreambotV2…")
     build_app().run_polling(drop_pending_updates=True)
-
